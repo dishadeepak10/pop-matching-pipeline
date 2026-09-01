@@ -1,0 +1,33 @@
+﻿def _parse_date_value(value):
+    """
+    Deterministic date parsing, two passes:
+      1. Try to interpret ambiguous numeric dates as month-first
+         (e.g. 07/21/2026 -> unambiguous, July 21).
+      2. If that fails (e.g. 13/07/2026, month=13 is invalid), retry
+         as day-first (13 July 2026).
+    Also handles text-month formats like "20 July, 01:22 PM" natively.
+
+    SAFETY CHECK (added after testing found pandas silently defaulting
+    to year 0001 when the source text had no year at all, e.g.
+    "20 July, 01:22 PM"): if the raw text does not contain an actual
+    4-digit year, we do NOT trust any year the parser fills in. We
+    return None instead, so the case surfaces for manual review
+    rather than silently carrying a fabricated year into matching.
+    No LLM involved at any point - pure deterministic parsing.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    has_explicit_year = bool(re.search(r"(19|20)\d{2}", text))
+
+    for dayfirst in (False, True):
+        parsed = pd.to_datetime(text, errors="coerce", dayfirst=dayfirst)
+        if pd.notna(parsed):
+            if not has_explicit_year:
+                return None
+            return parsed.strftime("%Y-%m-%d")
+
+    return None

@@ -1,0 +1,697 @@
+﻿import json
+from pathlib import Path
+
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from copy import copy
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+OUTPUT_ROOT = (
+    PROJECT_ROOT
+    / "data"
+    / "output"
+)
+
+EXCEL_OUTPUT_PATH = (
+    OUTPUT_ROOT
+    / "POP_extraction_normalized.xlsx"
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_value(data, *paths):
+    """
+    Return the first non-empty value found from the given paths.
+
+    Supports:
+    1. Normal dictionary-style data
+    2. Current POP extracted.json format:
+       {
+           "fields": [
+               {"field_name": "...", "value": "..."}
+           ]
+       }
+    """
+
+    # --------------------------------------------------------
+    # Current POP format:
+    # data["fields"] is a list of field objects
+    # --------------------------------------------------------
+    if isinstance(data, dict) and isinstance(data.get("fields"), list):
+
+        field_values = {}
+
+        for field in data["fields"]:
+            if not isinstance(field, dict):
+                continue
+
+            field_name = field.get("field_name")
+            value = field.get("value")
+
+            if field_name and value not in (None, ""):
+                field_values[field_name] = value
+
+        for path in paths:
+            if path in field_values:
+                return field_values[path]
+
+    # --------------------------------------------------------
+    # Normal dictionary-style format
+    # --------------------------------------------------------
+    for path in paths:
+
+        value = data
+
+        for key in path.split("."):
+
+            if not isinstance(value, dict):
+                value = None
+                break
+
+            value = value.get(key)
+
+        if value not in (None, ""):
+            return value
+
+    return ""
+
+def normalize_record(data, document_id):
+    """
+    Convert different POP JSON structures into one common schema.
+    """
+
+    record = {
+        "document_id": document_id,
+
+        # ----------------------------------------------------
+        # Document information
+        # ----------------------------------------------------
+
+        "document_type": get_value(
+            data,
+            "document_type",
+            "receipt_type",
+            "form_type"
+        ),
+
+        # ----------------------------------------------------
+        # Customer / sender
+        # ----------------------------------------------------
+
+        "customer_name": get_value(
+            data,
+            "customer_name",
+            "applicant_name",
+            "applicant_details.name",
+            "account_holder_name",
+            "payer_name",
+            "sender_name",
+            "depositor_name"
+        ),
+
+        "sender_name": get_value(
+           data,
+           "sender_name",
+           "payer_name",
+           "applicant_details.name",
+           "applicant_account_name",
+           "account_holder_name",
+           "depositor_name",
+           "transfer_details.from_account_holder",
+           "transfer_details.from_account_name"
+        ),
+        "sender_account": get_value(
+            data,
+            "sender_account_number",
+            "sender_account_number_masked",
+            "from_account",
+            "sending_account",
+            "applicant_account_number",
+            "applicant_details.account_no",
+            "account_details.account_number",
+            "account_details.account_no",
+            "transfer_details.from_account",
+            "transfer_details.from_account_number"
+        ),
+
+        # ----------------------------------------------------
+        # Beneficiary / recipient
+        # ----------------------------------------------------
+
+    "beneficiary_name": get_value(
+        data,
+        "beneficiary_name",
+        "recipient_name",
+        "counterparty_name",
+        "beneficiary_details.name",
+        "recipient_information.name",
+        "transfer_details.beneficiary_name",
+        "transfer_details.to_name",
+        "transfer_details.to_account_holder"
+    ),
+
+    "beneficiary_account": get_value(
+        data,
+        "beneficiary_account_number",
+        "beneficiary_account_number_masked",
+        "recipient_account_number",
+        "recipient_account_number_iban",
+        "beneficiary_details.account_number",
+        "counterparty_account",
+        "beneficiary_bank_details.account_number",
+        "transfer_details.to_account_number",
+        "transfer_details.to_account_number_iban"
+    ),
+
+        "beneficiary_address": get_value(
+            data,
+            "beneficiary_address",
+            "recipient_address",
+            "beneficiary_details.address",
+            "recipient_information.address"
+        ),
+
+        # ----------------------------------------------------
+        # Bank information
+        # ----------------------------------------------------
+
+        "bank_name": get_value(
+            data,
+            "bank_name",
+            "bank_full_name"
+        ),
+
+        "beneficiary_bank": get_value(
+            data,
+            "beneficiary_bank_name",
+            "receiving_bank",
+            "beneficiary_bank",
+            "recipient_bank_name",
+            "beneficiary_bank_details.bank_name",
+            "transfer_details.to_bank_name",
+            "transfer_details.delivery_bank"
+        ),
+
+        "beneficiary_bank_country": get_value(
+            data,
+            "beneficiary_bank_country",
+            "beneficiary_bank_details.bank_country"
+        ),
+
+        "beneficiary_swift": get_value(
+            data,
+            "beneficiary_swift_code",
+            "recipient_bank_swift_code",
+            "beneficiary_bank_details.swift_code",
+            "counterparty_bic"
+        ),
+        "sender_bank": get_value(
+            data,
+            "payer_bank",
+            "remitter_bank.name",
+            "from_bank",
+            "sending_bank",
+            "transfer_details.from_bank",
+            "bank_name"
+        ),
+        # ----------------------------------------------------
+        # Amount / currency
+        "amount": get_value(
+            data,
+            "transfer_amount",
+            "original_amount",
+            "amount",
+            "amount_sent",
+            "amount_aed",
+            "wire_amount_aed",
+            "amount_in_figure",
+            "total_amount",
+            "total_amount_debited",
+            "payment_details.amount",
+            "payment_details.amount_aed",
+            "payment_details.amount_sent",
+            "payment_details.total_to_recipient",
+            "transfer_details.amount",
+            "transfer_details.transaction_amount",
+            "transfer_details.debit_amount",
+            "foreign_exchange_details.amount"
+        ),
+        "amount_sent": get_value(
+            data,
+            "amount_sent",
+            "transfer_amount_usd",
+            "payment_details.amount_sent"
+        ),
+        "amount_received": get_value(
+            data,
+            "amount_received",
+            "amount_in_destination_currency",
+            "payment_details.total_to_recipient"
+        ),
+        "currency": get_value(
+            data,
+            "transfer_currency",
+            "currency",
+            "overseas_currency",
+            "original_currency",
+            "payment_details.currency",
+            "beneficiary_details.currency",
+            "transfer_details.beneficiary_currency",
+            "transfer_details.currency"
+        ),
+        "original_amount": get_value(
+            data,
+            "original_amount"
+        ),
+
+        "original_currency": get_value(
+            data,
+            "original_currency"
+        ),
+        "amount_in_words": get_value(
+            data,
+            "transfer_amount_in_words",
+            "amount_in_words",
+            "total_amount_in_words",
+            "payment_details.amount_in_words",
+            "payment_details.total_amount_in_words"
+        ),
+
+        "exchange_rate": get_value(
+            data,
+            "exchange_rate",
+            "conversion_rate",
+            "foreign_exchange_details.exchange_rate",
+            "transfer_details.exchange_rate"
+        ),
+
+        "fee": get_value(
+            data,
+            "fee",
+            "transfer_fees_plus_vat",
+            "outgoing_wire_transfer_fee",
+            "hsbc_uk_fee",
+            "payment_details.fee"
+        ),
+
+        # ----------------------------------------------------
+        # Date / time
+        # ----------------------------------------------------
+        "transaction_date": get_value(
+            data,
+            "transaction_date",
+            "transfer_date",
+            "payment_date",
+            "receipt_date",
+            "date",
+            "date_of_application",
+            "wire_date",
+            "effective_date",
+            "value_date",
+
+            # Additional date/date-time fields found during 25-case validation
+            "date_and_time",
+            "transfer_date_time",
+            "transaction_date_time",
+            "transaction_time",
+            "request_submitted_date_time",
+            "payment_in_progress_date_time",
+            "payment_submitted_date_time",
+            "available_date_time_aest",
+            "available_date_time_gst",
+            "receipt_1_receipt_date",
+            "receipt_2_receipt_date",
+            "declaration_signature_date"
+        ),
+        "transaction_time": get_value(
+            data,
+            "transaction_time",
+            "transfer_time",
+            "time"
+        ),
+        "date_and_time": get_value(
+            data,
+            "date_and_time",
+            "creation_datetime",
+            "printed_on",
+            "transfer_details.date_and_time"
+        ),
+        # ----------------------------------------------------
+        # References
+        # ----------------------------------------------------
+        "reference_number": get_value(
+            data,
+            "reference_number",
+            "reference",
+            "transaction_reference",
+            "transaction_id",
+            "transaction_number",
+            "transaction_receipt_number",
+            "receipt_number",
+            "payment_number",
+            "booking_reference",
+            "transaction_hash",
+            "transfer_details.reference_number"
+        ),
+        # ----------------------------------------------------
+        # Additional transaction information
+        # ----------------------------------------------------
+
+        "transaction_status": get_value(
+            data,
+            "wire_status",
+            "payment_status",
+            "current_status",
+            "receipt_status"
+        ),
+
+        "transaction_number": get_value(
+            data,
+            "transaction_number",
+            "transaction_id",
+            "transaction_reference",
+            "transfer_details.reference_number"
+        ),
+
+        "tracking_number": get_value(
+            data,
+            "chase_wire_tracking_number",
+            "tracking_number",
+            "wire_tracking_number"
+        ),
+       "source_of_funds": get_value(
+            data,
+            "source_of_funds",
+            "sources_of_funds"
+        ),     
+        "foreign_bank_charges": get_value(
+            data,
+            "foreign_bank_charges",
+            "beneficiary_bank_details.foreign_bank_charges"
+        ),
+
+        "branch_name": get_value(
+            data,
+            "branch_name"
+        ),
+
+        "branch_code": get_value(
+            data,
+            "branch_code"
+        ),
+
+        "pan_number": get_value(
+            data,
+            "pan_number",
+            "lrs_transaction_under_pan",
+            "applicant_details.pan_no",
+            "purpose_of_remittance.pan_no"
+        ),
+
+        "amount_in_inr": get_value(
+            data,
+            "amount_in_indian_rupees"
+        ),
+
+        "amount_in_usd": get_value(
+            data,
+            "transfer_amount_usd",
+            "total_usd"
+        ),
+        # ----------------------------------------------------
+        # Payment / transfer information
+        # ----------------------------------------------------       
+        "payment_method": get_value(
+            data,
+            "mode_of_payment",
+            "payment_details.mode_of_payment",
+            "payment_type"
+        ),
+        "transfer_type": get_value(
+            data,
+            "transfer_type"
+        ),
+
+        "purpose": get_value(
+            data,
+            "purpose_of_payment",
+            "purpose_of_remittance.purpose_code",
+            "purpose_of_remittance.purpose",
+            "transfer_purpose",
+            "reason_for_payment",
+            "payment_details.purpose",
+            "transfer_details.purpose"
+        ),
+
+        "status": get_value(
+            data,
+            "payment_status",
+            "current_status",
+            "receipt_status"
+        ),
+
+        "notes": get_value(
+            data,
+            "note_to_beneficiary",
+            "memo",
+            "notes",
+            "description",
+            "remarks_in_swift_message"
+        ),
+    }
+
+
+    # Handle POP documents containing multiple receipts
+    if not record["amount"] and isinstance(data.get("receipts"), list):
+        receipt_total = 0
+        found_receipt_amount = False
+
+        for receipt in data["receipts"]:
+            if isinstance(receipt, dict):
+                value = receipt.get("amount")
+                if value not in (None, ""):
+                    try:
+                        numeric_value = float(
+                            str(value).replace("AED", "").replace(",", "").strip()
+                        )
+                        receipt_total += numeric_value
+                        found_receipt_amount = True
+                    except (ValueError, TypeError):
+                        pass
+
+        if found_receipt_amount:
+            record["amount"] = receipt_total
+    return record
+
+
+# ============================================================
+# LOAD JSON FILES
+# ============================================================
+
+def load_extracted_data():
+
+    json_files = sorted(
+        OUTPUT_ROOT.glob(
+            "*/extracted.json"
+        )
+    )
+
+    print(
+        f"Found {len(json_files)} extracted JSON files."
+    )
+
+    if not json_files:
+
+        raise FileNotFoundError(
+            "No extracted.json files found."
+        )
+
+    records = []
+
+    for json_file in json_files:
+
+        document_id = json_file.parent.name
+
+        print(
+            f"Reading: {document_id}"
+        )
+
+        with open(
+            json_file,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(file)
+
+        normalized_data = normalize_record(
+            data,
+            document_id
+        )
+
+        records.append(
+            normalized_data
+        )
+
+    return records
+
+
+# ============================================================
+# CREATE EXCEL REPORT
+# ============================================================
+
+def create_excel_report(records):
+
+    workbook = Workbook()
+
+    worksheet = workbook.active
+    worksheet.title = "POP Extraction"
+
+    columns = list(records[0].keys())
+
+    # --------------------------------------------------------
+    # Headers
+    # --------------------------------------------------------
+
+    for column_number, column_name in enumerate(
+        columns,
+        start=1
+    ):
+
+        cell = worksheet.cell(
+            row=1,
+            column=column_number,
+            value=column_name
+        )
+
+        font = copy(cell.font)
+        font.bold = True
+        cell.font = font
+
+        # --------------------------------------------------------
+    # Data
+    # --------------------------------------------------------
+
+    for row_number, record in enumerate(
+        records,
+        start=2
+    ):
+
+        for column_number, column_name in enumerate(
+            columns,
+            start=1
+        ):
+
+            value = record.get(
+                column_name,
+                ""
+            )
+
+            if isinstance(value, dict):
+
+                print()
+                print("DICT FOUND")
+                print("Document:", record.get("document_id"))
+                print("Column:", column_name)
+                print("Value:", value)
+                print()
+
+                value = json.dumps(value)
+
+            worksheet.cell(
+                row=row_number,
+                column=column_number,
+                value=value
+            )
+    # --------------------------------------------------------
+    # Formatting
+    # --------------------------------------------------------
+
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+
+    for column_number in range(
+        1,
+        worksheet.max_column + 1
+    ):
+
+        column_letter = get_column_letter(
+            column_number
+        )
+
+        max_length = 0
+
+        for cell in worksheet[column_letter]:
+
+            if cell.value is not None:
+
+                length = len(
+                    str(cell.value)
+                )
+
+                if length > max_length:
+                    max_length = length
+
+        worksheet.column_dimensions[
+            column_letter
+        ].width = min(
+            max_length + 2,
+            40
+        )
+
+    workbook.save(
+        EXCEL_OUTPUT_PATH
+    )
+
+    print()
+    print("=" * 70)
+    print("NORMALIZED EXCEL REPORT CREATED")
+    print("=" * 70)
+
+    print(
+        f"Rows: {len(records)}"
+    )
+
+    print(
+        f"Columns: {len(columns)}"
+    )
+
+    print(
+        f"Output: {EXCEL_OUTPUT_PATH}"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print()
+    print("=" * 70)
+    print("POP NORMALIZED EXCEL REPORT GENERATION")
+    print("=" * 70)
+
+    records = load_extracted_data()
+
+    create_excel_report(records)
+
+    print()
+    print("NORMALIZED REPORT GENERATION COMPLETE.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+

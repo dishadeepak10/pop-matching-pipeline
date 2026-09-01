@@ -1,0 +1,16 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.env
+
+build/
+dist/
+deploy_test/
+
+bank_statements/
+data/
+logs/
+pop_input/
+testing_bank_statements/
+
+archive/failed_formats_report.txt

@@ -1,0 +1,4 @@
+﻿case_number,email_receipt_amount,email_receipt_reference,email_bank_account,email_customer_name,email_customer_bank,email_payment_method,bank_source_file,bank_name
+DEMO001,15000.00,REF-DEMO-001,111222333,John Sample,Demo Bank UAE,Bank Transfer,demo_bank_statement.xlsx,DEMO BANK
+DEMO002,7500.50,REF-DEMO-002,111222444,Jane Example,Demo Bank UAE,Bank Transfer,demo_bank_statement.xlsx,DEMO BANK
+DEMO003,32000.00,REF-DEMO-003,111222555,Ali Testcase,Demo Bank UAE,Bank Transfer,demo_bank_statement.xlsx,DEMO BANK

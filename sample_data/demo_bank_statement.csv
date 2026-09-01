@@ -1,0 +1,5 @@
+﻿date,value_date,description,reference,customer_reference,transaction_type,debit_amount,credit_amount,balance,bank_name,source_file
+2026-08-01,2026-08-01,Incoming transfer REF-DEMO-001,REF-DEMO-001,John Sample,Credit,,15000.00,115000.00,DEMO BANK,demo_bank_statement.xlsx
+2026-08-02,2026-08-02,Incoming transfer REF-DEMO-002,REF-DEMO-002,Jane Example,Credit,,7500.50,122500.50,DEMO BANK,demo_bank_statement.xlsx
+2026-08-03,2026-08-03,Incoming transfer REF-DEMO-003,REF-DEMO-003,Ali Testcase,Credit,,32000.00,154500.50,DEMO BANK,demo_bank_statement.xlsx
+2026-08-04,2026-08-04,Unrelated transaction,MISC-999,Other Party,Debit,5000.00,,149500.50,DEMO BANK,demo_bank_statement.xlsx

@@ -1,0 +1,2794 @@
+﻿from pathlib import Path
+import re
+import unicodedata
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+POP_FILE = Path(
+    r"D:\AUG-bank_files\normalization_input\AUG_POP_matching_input.xlsx"
+)
+
+BANK_FILE = Path(
+    r"D:\AUG-bank_files\normalization_input\normalized_bank_statements.xlsx"
+)
+
+OUTPUT_DIR = Path(
+    r"D:\Disha_Workarea\pop_process\data\output"
+)
+
+MATCH_OUTPUT = OUTPUT_DIR / "POP_bank_matches_v5.xlsx"
+CANDIDATE_OUTPUT = OUTPUT_DIR / "POP_bank_candidates_v5.xlsx"
+
+
+# ============================================================
+# MATCHING SETTINGS
+# ============================================================
+
+# Exact amount tolerance.
+AMOUNT_TOLERANCE = 0.01
+
+# Near amount is NOT treated as an exact match.
+# It is only considered when no exact amount exists.
+NEAR_AMOUNT_TOLERANCE = 1500.00
+
+# Score components.
+EXACT_AMOUNT_SCORE = 50
+
+REFERENCE_EXACT_SCORE = 40
+REFERENCE_STRONG_SCORE = 25
+REFERENCE_PARTIAL_SCORE = 10
+
+CUSTOMER_EXACT_SCORE = 30
+CUSTOMER_STRONG_SCORE = 20
+CUSTOMER_PARTIAL_SCORE = 10
+
+BANK_NAME_EXACT_SCORE = 10
+
+# Date support is optional because the current POP file
+# contains no transaction_date column.
+EXACT_DATE_SCORE = 40
+DATE_1_DAY_SCORE = 30
+DATE_2_DAY_SCORE = 25
+DATE_3_DAY_SCORE = 20
+DATE_4_DAY_SCORE = 15
+DATE_5_DAY_SCORE = 10
+
+DATE_WINDOW_DAYS = 5
+
+# Strict match threshold.
+MATCH_THRESHOLD = 80
+
+# Near-amount matches require stronger evidence.
+NEAR_MATCH_THRESHOLD = 100
+
+# Minimum separation between candidates.
+MIN_SCORE_GAP = 20
+
+
+# ============================================================
+# STOP WORDS
+# ============================================================
+
+STOP_WORDS = {
+    "THE",
+    "AND",
+    "OF",
+    "FOR",
+    "TO",
+    "FROM",
+    "BANK",
+    "PAYMENT",
+    "TRANSFER",
+    "TRANSFERRED",
+    "REF",
+    "REFERENCE",
+    "RECEIPT",
+    "RECEIPTNO",
+    "RECEIPTNUMBER",
+    "TRANSACTION",
+    "TRANSACTIONNO",
+    "TRANSACTIONNUMBER",
+    "FTS",
+    "IPP",
+    "B",
+    "BO",
+    "BENEFR",
+    "BENEFICIARY",
+    "CUSTOMER",
+    "NAME",
+}
+
+
+# ============================================================
+# TEXT HELPERS
+# ============================================================
+
+def clean_text(value):
+    """
+    Normalize arbitrary text into uppercase alphanumeric text
+    separated by single spaces.
+    """
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+
+    if text.lower() in {
+        "nan",
+        "none",
+        "nat",
+        "<na>",
+    }:
+        return ""
+
+    text = unicodedata.normalize("NFKD", text)
+    text = text.upper()
+
+    text = re.sub(
+        r"[^A-Z0-9]+",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    return text
+
+
+def compact_text(value):
+    """
+    Remove spaces from normalized text.
+    Useful for references where one source may contain
+    spaces/hyphens and the other may not.
+    """
+    return clean_text(value).replace(" ", "")
+
+
+def text_tokens(value):
+    """
+    Tokenize normalized text while removing generic banking
+    words and very short tokens.
+    """
+    text = clean_text(value)
+
+    if not text:
+        return set()
+
+    result = set()
+
+    for token in text.split():
+        if token in STOP_WORDS:
+            continue
+
+        if len(token) < 3:
+            continue
+
+        result.add(token)
+
+    return result
+
+
+# ============================================================
+# ACCOUNT HELPERS
+# ============================================================
+
+def normalize_account(value):
+    """
+    Normalize bank-account identifiers.
+
+    Handles:
+    - numeric Excel values such as 123456.0
+    - spaces
+    - hyphens
+    """
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+
+    # Excel-style integer suffix.
+    text = re.sub(
+        r"\.0$",
+        "",
+        text,
+    )
+
+    # Remove spaces and hyphens.
+    text = re.sub(
+        r"[\s\-]+",
+        "",
+        text,
+    )
+
+    return text
+
+
+def normalize_filename(value):
+    """
+    Normalize a source filename for comparison.
+    """
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+
+    if not text:
+        return ""
+
+    return clean_text(text)
+
+
+def source_file_matches(
+    pop_source,
+    bank_source,
+):
+    """
+    Determine whether POP bank_source_file identifies the
+    bank statement source.
+
+    Uses normalized filename equality first, then a conservative
+    filename containment check.
+    """
+    pop_source = str(pop_source).strip()
+    bank_source = str(bank_source).strip()
+
+    if not pop_source or not bank_source:
+        return False
+
+    pop_norm = normalize_filename(pop_source)
+    bank_norm = normalize_filename(bank_source)
+
+    if not pop_norm or not bank_norm:
+        return False
+
+    if pop_norm == bank_norm:
+        return True
+
+    # Compare filenames without extensions.
+    pop_stem = Path(pop_source).stem
+    bank_stem = Path(bank_source).stem
+
+    pop_stem_norm = normalize_filename(pop_stem)
+    bank_stem_norm = normalize_filename(bank_stem)
+
+    if (
+        pop_stem_norm
+        and bank_stem_norm
+        and pop_stem_norm == bank_stem_norm
+    ):
+        return True
+
+    return False
+
+
+# ============================================================
+# NUMERIC HELPERS
+# ============================================================
+
+def numeric(value):
+    """
+    Safely convert value to float.
+    """
+    if pd.isna(value):
+        return np.nan
+
+    if isinstance(value, str):
+        text = value.strip()
+
+        if not text:
+            return np.nan
+
+        # Remove common comma formatting.
+        text = text.replace(",", "")
+
+        # Remove currency symbols.
+        text = re.sub(
+            r"[₹$€£]",
+            "",
+            text,
+        ).strip()
+
+        # Handle parentheses as negative.
+        if (
+            text.startswith("(")
+            and text.endswith(")")
+        ):
+            text = "-" + text[1:-1]
+
+        try:
+            return float(text)
+        except Exception:
+            return np.nan
+
+    try:
+        return float(value)
+    except Exception:
+        return np.nan
+
+
+def bank_amount(row):
+    """
+    Determine transaction amount from bank credit/debit columns.
+
+    Magnitude is used because POP payment amount represents
+    the payment value rather than debit/credit direction.
+    """
+    credit = numeric(
+        row.get("credit_amount")
+    )
+
+    debit = numeric(
+        row.get("debit_amount")
+    )
+
+    if (
+        not pd.isna(credit)
+        and abs(credit) > AMOUNT_TOLERANCE
+    ):
+        return abs(credit)
+
+    if (
+        not pd.isna(debit)
+        and abs(debit) > AMOUNT_TOLERANCE
+    ):
+        return abs(debit)
+
+    return np.nan
+
+
+# ============================================================
+# DATE HELPERS
+# ============================================================
+
+def parse_date(value):
+    """
+    Safely parse a date.
+
+    This function remains available because bank statements
+    contain dates and future POP versions may contain dates.
+
+    IMPORTANT:
+    The current POP file has no date column, so date is NOT
+    required for the current matching run.
+    """
+    if pd.isna(value):
+        return pd.NaT
+
+    if isinstance(
+        value,
+        pd.Timestamp,
+    ):
+        return value.normalize()
+
+    if hasattr(value, "year") and hasattr(
+        value,
+        "month",
+    ) and hasattr(
+        value,
+        "day",
+    ):
+        try:
+            return pd.Timestamp(value).normalize()
+        except Exception:
+            pass
+
+    text = str(value).strip()
+
+    if not text:
+        return pd.NaT
+
+    # Remove common timezone labels.
+    text = re.sub(
+        r"\b(IST|AEST|AEDT|GST|UTC)\b",
+        "",
+        text,
+        flags=re.I,
+    )
+
+    # Remove common time components.
+    text = re.sub(
+        r",?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(AM|PM)?",
+        "",
+        text,
+        flags=re.I,
+    )
+
+    text = re.sub(
+        r"\s*-\s*\d{1,2}:\d{2}\s*(AM|PM)?",
+        "",
+        text,
+        flags=re.I,
+    )
+
+    text = re.sub(
+        r",\s*",
+        " ",
+        text,
+    ).strip()
+
+    # ISO format.
+    iso_match = re.fullmatch(
+        r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})",
+        text,
+    )
+
+    if iso_match:
+        try:
+            return pd.Timestamp(
+                year=int(iso_match.group(1)),
+                month=int(iso_match.group(2)),
+                day=int(iso_match.group(3)),
+            ).normalize()
+        except Exception:
+            return pd.NaT
+
+    # Reject obviously corrupt years.
+    year_match = re.search(
+        r"(\d{4})",
+        text,
+    )
+
+    if year_match:
+        year = int(year_match.group(1))
+
+        if year < 2000 or year > 2100:
+            return pd.NaT
+
+    # Source data is predominantly DD/MM/YYYY.
+    for dayfirst in (
+        True,
+        False,
+    ):
+        try:
+            parsed = pd.to_datetime(
+                text,
+                errors="coerce",
+                dayfirst=dayfirst,
+            )
+
+            if not pd.isna(parsed):
+                parsed = pd.Timestamp(
+                    parsed
+                ).normalize()
+
+                if 2000 <= parsed.year <= 2100:
+                    return parsed
+
+        except Exception:
+            pass
+
+    return pd.NaT
+
+
+# ============================================================
+# BANK SOURCE MAP
+# ============================================================
+
+def build_account_file_map(bank_df):
+    """
+    Build account -> source-file mapping.
+
+    The bank normalization source_file commonly contains an
+    account number. We extract the final numeric component
+    immediately before the extension.
+
+    This is only a FALLBACK mechanism.
+
+    POP bank_source_file is preferred whenever available.
+    """
+    mapping = {}
+
+    for source in (
+        bank_df["source_file"]
+        .dropna()
+        .unique()
+    ):
+        source = str(source).strip()
+
+        if not source:
+            continue
+
+        # Example:
+        # statement-123456.xlsx
+        # statement_123456.csv
+        match = re.search(
+            r"[-_\s](\d+)\.(?:xls|xlsx|csv)$",
+            source,
+            flags=re.I,
+        )
+
+        if not match:
+            continue
+
+        account = normalize_account(
+            match.group(1)
+        )
+
+        if not account:
+            continue
+
+        mapping.setdefault(
+            account,
+            [],
+        ).append(source)
+
+    return mapping
+
+
+# ============================================================
+# POP FIELD EXTRACTION
+# ============================================================
+
+def get_pop_reference(pop_row):
+    """
+    Current POP schema has one explicit reference field:
+        email_receipt_reference
+    """
+    value = clean_text(
+        pop_row.get(
+            "email_receipt_reference"
+        )
+    )
+
+    return value
+
+
+def get_pop_customer(pop_row):
+    """
+    Current POP schema:
+        email_customer_name
+    """
+    value = clean_text(
+        pop_row.get(
+            "email_customer_name"
+        )
+    )
+
+    return value
+
+
+def get_pop_source(pop_row):
+    """
+    Current POP schema:
+        bank_source_file
+    """
+    value = pop_row.get(
+        "bank_source_file"
+    )
+
+    if pd.isna(value):
+        return ""
+
+    return str(value).strip()
+
+
+def get_pop_bank_name(pop_row):
+    """
+    Current POP schema:
+        bank_name
+    """
+    return clean_text(
+        pop_row.get(
+            "bank_name"
+        )
+    )
+
+
+# ============================================================
+# BANK SEARCH TEXT
+# ============================================================
+
+def get_bank_reference_text(bank_row):
+    """
+    Combine bank fields that may contain a payment reference.
+    """
+    values = [
+        bank_row.get("reference"),
+        bank_row.get("customer_reference"),
+        bank_row.get("description"),
+    ]
+
+    cleaned = []
+
+    for value in values:
+        value = clean_text(value)
+
+        if value:
+            cleaned.append(value)
+
+    return " ".join(cleaned)
+
+
+def get_bank_customer_text(bank_row):
+    """
+    Combine bank fields that may contain customer/sender name.
+    """
+    values = [
+        bank_row.get("description"),
+        bank_row.get("reference"),
+        bank_row.get("customer_reference"),
+    ]
+
+    cleaned = []
+
+    for value in values:
+        value = clean_text(value)
+
+        if value:
+            cleaned.append(value)
+
+    return " ".join(cleaned)
+
+
+# ============================================================
+# REFERENCE MATCH
+# ============================================================
+
+def reference_match(
+    pop_row,
+    bank_row,
+):
+    """
+    Match email_receipt_reference against bank reference,
+    customer reference and description.
+
+    Strongest evidence:
+        exact compact reference
+
+    Secondary:
+        token overlap
+    """
+    pop_reference = get_pop_reference(
+        pop_row
+    )
+
+    if not pop_reference:
+        return 0, ""
+
+    bank_text = get_bank_reference_text(
+        bank_row
+    )
+
+    if not bank_text:
+        return 0, ""
+
+    bank_compact = compact_text(
+        bank_text
+    )
+
+    bank_tokens = text_tokens(
+        bank_text
+    )
+
+    pop_compact = compact_text(
+        pop_reference
+    )
+
+    # --------------------------------------------------------
+    # EXACT COMPACT REFERENCE
+    # --------------------------------------------------------
+
+    if (
+        pop_compact
+        and pop_compact in bank_compact
+    ):
+        return (
+            REFERENCE_EXACT_SCORE,
+            "REFERENCE_EXACT",
+        )
+
+    # --------------------------------------------------------
+    # TOKEN MATCH
+    # --------------------------------------------------------
+
+    pop_tokens = text_tokens(
+        pop_reference
+    )
+
+    if not pop_tokens:
+        return 0, ""
+
+    overlap = (
+        pop_tokens
+        & bank_tokens
+    )
+
+    if not overlap:
+        return 0, ""
+
+    ratio = (
+        len(overlap)
+        / len(pop_tokens)
+    )
+
+    if ratio >= 0.75:
+        return (
+            REFERENCE_STRONG_SCORE,
+            "REFERENCE_STRONG:"
+            + ",".join(
+                sorted(overlap)
+            ),
+        )
+
+    if ratio >= 0.50:
+        return (
+            REFERENCE_PARTIAL_SCORE,
+            "REFERENCE_PARTIAL:"
+            + ",".join(
+                sorted(overlap)
+            ),
+        )
+
+    return 0, ""
+
+
+# ============================================================
+# CUSTOMER MATCH
+# ============================================================
+
+def customer_match(
+    pop_row,
+    bank_row,
+):
+    """
+    Match email_customer_name against bank textual fields.
+    """
+    pop_customer = get_pop_customer(
+        pop_row
+    )
+
+    if not pop_customer:
+        return 0, ""
+
+    bank_text = get_bank_customer_text(
+        bank_row
+    )
+
+    if not bank_text:
+        return 0, ""
+
+    # --------------------------------------------------------
+    # EXACT FULL NAME
+    # --------------------------------------------------------
+
+    if pop_customer in bank_text:
+        return (
+            CUSTOMER_EXACT_SCORE,
+            "CUSTOMER_EXACT",
+        )
+
+    # --------------------------------------------------------
+    # TOKEN MATCH
+    # --------------------------------------------------------
+
+    pop_tokens = text_tokens(
+        pop_customer
+    )
+
+    bank_tokens = text_tokens(
+        bank_text
+    )
+
+    if not pop_tokens:
+        return 0, ""
+
+    overlap = (
+        pop_tokens
+        & bank_tokens
+    )
+
+    if not overlap:
+        return 0, ""
+
+    ratio = (
+        len(overlap)
+        / len(pop_tokens)
+    )
+
+    if ratio >= 0.75:
+        return (
+            CUSTOMER_STRONG_SCORE,
+            "CUSTOMER_STRONG:"
+            + ",".join(
+                sorted(overlap)
+            ),
+        )
+
+    if ratio >= 0.50:
+        return (
+            CUSTOMER_PARTIAL_SCORE,
+            "CUSTOMER_PARTIAL:"
+            + ",".join(
+                sorted(overlap)
+            ),
+        )
+
+    return 0, ""
+
+
+# ============================================================
+# BANK NAME MATCH
+# ============================================================
+
+def bank_name_match(
+    pop_row,
+    bank_row,
+):
+    """
+    Compare POP bank_name with normalized bank_name.
+    """
+    pop_bank = get_pop_bank_name(
+        pop_row
+    )
+
+    bank_bank = clean_text(
+        bank_row.get(
+            "bank_name"
+        )
+    )
+
+    if not pop_bank or not bank_bank:
+        return 0, ""
+
+    if (
+        pop_bank == bank_bank
+        or pop_bank in bank_bank
+        or bank_bank in pop_bank
+    ):
+        return (
+            BANK_NAME_EXACT_SCORE,
+            "BANK_NAME_MATCH",
+        )
+
+    return 0, ""
+
+
+# ============================================================
+# OPTIONAL DATE MATCH
+# ============================================================
+
+def date_match(
+    pop_row,
+    bank_row,
+):
+    """
+    Date scoring is OPTIONAL.
+
+    Current POP file has no transaction_date field, so this
+    function normally returns zero.
+
+    If a future POP file contains transaction_date, the date
+    becomes active automatically.
+    """
+    pop_date_value = pop_row.get(
+        "transaction_date"
+    )
+
+    if pd.isna(pop_date_value):
+        return 0, np.nan, ""
+
+    pop_date = parse_date(
+        pop_date_value
+    )
+
+    bank_date = parse_date(
+        bank_row.get("date")
+    )
+
+    if (
+        pd.isna(pop_date)
+        or pd.isna(bank_date)
+    ):
+        return 0, np.nan, ""
+
+    diff = abs(
+        (bank_date - pop_date).days
+    )
+
+    if diff == 0:
+        return (
+            EXACT_DATE_SCORE,
+            diff,
+            "DATE_EXACT",
+        )
+
+    if diff == 1:
+        return (
+            DATE_1_DAY_SCORE,
+            diff,
+            "DATE_1_DAY",
+        )
+
+    if diff == 2:
+        return (
+            DATE_2_DAY_SCORE,
+            diff,
+            "DATE_2_DAYS",
+        )
+
+    if diff == 3:
+        return (
+            DATE_3_DAY_SCORE,
+            diff,
+            "DATE_3_DAYS",
+        )
+
+    if diff == 4:
+        return (
+            DATE_4_DAY_SCORE,
+            diff,
+            "DATE_4_DAYS",
+        )
+
+    if diff <= DATE_WINDOW_DAYS:
+        return (
+            DATE_5_DAY_SCORE,
+            diff,
+            "DATE_5_DAYS",
+        )
+
+    return 0, diff, ""
+
+
+# ============================================================
+# CANDIDATE SCORING
+# ============================================================
+
+def score_candidate(
+    pop_row,
+    bank_row,
+    amount_difference,
+    exact_amount,
+):
+    """
+    Calculate the evidence score.
+
+    IMPORTANT:
+    Amount is the strongest primary gate.
+
+    Reference and customer evidence are independent supporting
+    evidence.
+
+    Date contributes only if a real POP transaction_date exists.
+    """
+    score = 0
+    reasons = []
+
+    # --------------------------------------------------------
+    # AMOUNT
+    # --------------------------------------------------------
+
+    if exact_amount:
+        score += EXACT_AMOUNT_SCORE
+        reasons.append(
+            "AMOUNT_EXACT"
+        )
+
+    else:
+        if amount_difference <= 250:
+            score += 35
+            reasons.append(
+                "AMOUNT_NEAR_STRONG"
+            )
+
+        elif amount_difference <= 750:
+            score += 25
+            reasons.append(
+                "AMOUNT_NEAR_MODERATE"
+            )
+
+        else:
+            score += 10
+            reasons.append(
+                "AMOUNT_NEAR_WEAK"
+            )
+
+    # --------------------------------------------------------
+    # DATE
+    # --------------------------------------------------------
+
+    date_score, date_diff, date_reason = date_match(
+        pop_row,
+        bank_row,
+    )
+
+    score += date_score
+
+    if date_reason:
+        reasons.append(
+            date_reason
+        )
+
+    # --------------------------------------------------------
+    # REFERENCE
+    # --------------------------------------------------------
+
+    reference_score, reference_reason = reference_match(
+        pop_row,
+        bank_row,
+    )
+
+    score += reference_score
+
+    if reference_reason:
+        reasons.append(
+            reference_reason
+        )
+
+    # --------------------------------------------------------
+    # CUSTOMER
+    # --------------------------------------------------------
+
+    customer_score, customer_reason = customer_match(
+        pop_row,
+        bank_row,
+    )
+
+    score += customer_score
+
+    if customer_reason:
+        reasons.append(
+            customer_reason
+        )
+
+    # --------------------------------------------------------
+    # BANK NAME
+    # --------------------------------------------------------
+
+    bank_name_score, bank_name_reason = bank_name_match(
+        pop_row,
+        bank_row,
+    )
+
+    score += bank_name_score
+
+    if bank_name_reason:
+        reasons.append(
+            bank_name_reason
+        )
+
+    return {
+        "score": score,
+        "amount_difference": amount_difference,
+        "date_difference_days": date_diff,
+        "reasons": "|".join(
+            reasons
+        ),
+    }
+
+
+# ============================================================
+# SORT
+# ============================================================
+
+def sort_candidates(rows):
+    """
+    Sort strongest candidates first.
+
+    Primary:
+        score
+
+    Secondary:
+        smallest amount difference
+
+    Tertiary:
+        smallest date difference when date exists
+    """
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["score"],
+            -row["amount_difference"],
+            -(
+                row["date_difference_days"]
+                if not pd.isna(
+                    row["date_difference_days"]
+                )
+                else 999999
+            ),
+        ),
+        reverse=True,
+    )
+
+
+# ============================================================
+# CANDIDATE SOURCE FILTER
+# ============================================================
+
+def get_source_candidates(
+    pop_row,
+    bank_df,
+    account_map,
+):
+    """
+    Restrict bank rows using the strongest available source
+    information.
+
+    Priority:
+
+    1. POP bank_source_file
+    2. POP email_bank_account -> source file map
+    3. Otherwise no source candidates
+    """
+    pop_source = get_pop_source(
+        pop_row
+    )
+
+    pop_account = normalize_account(
+        pop_row.get(
+            "email_bank_account"
+        )
+    )
+
+    # --------------------------------------------------------
+    # SOURCE FILE FIRST
+    # --------------------------------------------------------
+
+    if pop_source:
+        mask = bank_df[
+            "source_file"
+        ].apply(
+            lambda value:
+                source_file_matches(
+                    pop_source,
+                    value,
+                )
+        )
+
+        source_subset = bank_df[
+            mask
+        ].copy()
+
+        if not source_subset.empty:
+            return (
+                source_subset,
+                "POP_SOURCE_FILE",
+            )
+
+    # --------------------------------------------------------
+    # ACCOUNT FALLBACK
+    # --------------------------------------------------------
+
+    if pop_account:
+        source_files = account_map.get(
+            pop_account,
+            [],
+        )
+
+        if source_files:
+            source_subset = bank_df[
+                bank_df[
+                    "source_file"
+                ]
+                .astype(str)
+                .isin(source_files)
+            ].copy()
+
+            if not source_subset.empty:
+                return (
+                    source_subset,
+                    "POP_ACCOUNT",
+                )
+
+    return (
+        pd.DataFrame(
+            columns=bank_df.columns
+        ),
+        "SOURCE_NOT_FOUND",
+    )
+
+
+# ============================================================
+# MATCH ONE POP CASE
+# ============================================================
+
+def match_one(
+    pop_row,
+    bank_df,
+    account_map,
+    locked_rows,
+):
+    """
+    Match one POP row against the relevant bank statement.
+
+    Current POP schema:
+
+        case_number
+        email_receipt_amount
+        email_receipt_reference
+        email_bank_account
+        email_customer_name
+        email_customer_bank
+        email_payment_method
+        bank_source_file
+        bank_name
+    """
+
+    case = pop_row.get(
+        "case_number"
+    )
+
+    pop_account = normalize_account(
+        pop_row.get(
+            "email_bank_account"
+        )
+    )
+
+    pop_amount = numeric(
+        pop_row.get(
+            "email_receipt_amount"
+        )
+    )
+
+    if not pd.isna(pop_amount):
+        pop_amount = abs(
+            pop_amount
+        )
+
+    pop_reference = pop_row.get(
+        "email_receipt_reference"
+    )
+
+    pop_customer = pop_row.get(
+        "email_customer_name"
+    )
+
+    pop_source = get_pop_source(
+        pop_row
+    )
+
+    pop_bank_name = pop_row.get(
+        "bank_name"
+    )
+
+    # Optional future date.
+    pop_date = parse_date(
+        pop_row.get(
+            "transaction_date"
+        )
+    )
+
+    base = {
+        "case_number": case,
+        "pop_account": pop_account,
+        "pop_amount": pop_amount,
+        "pop_date": pop_date,
+        "pop_reference": pop_reference,
+        "pop_customer_name": pop_customer,
+        "pop_bank_name": pop_bank_name,
+        "pop_source_file": pop_source,
+    }
+
+    # ========================================================
+    # AMOUNT VALIDATION
+    # ========================================================
+
+    if pd.isna(pop_amount):
+        return (
+            {
+                **base,
+                "status": "NO_MATCH",
+                "match_reason": "POP_AMOUNT_MISSING",
+                "candidate_count": 0,
+            },
+            [],
+        )
+
+    # ========================================================
+    # SOURCE FILTER
+    # ========================================================
+
+    source_subset, source_mode = get_source_candidates(
+        pop_row,
+        bank_df,
+        account_map,
+    )
+
+    if source_subset.empty:
+        return (
+            {
+                **base,
+                "status": "NO_MATCH",
+                "match_reason": (
+                    "BANK_SOURCE_NOT_FOUND"
+                ),
+                "candidate_count": 0,
+                "source_mode": source_mode,
+            },
+            [],
+        )
+
+    # ========================================================
+    # BANK AMOUNTS
+    # ========================================================
+
+    source_subset = source_subset.copy()
+
+    source_subset["txn_amount"] = source_subset.apply(
+        bank_amount,
+        axis=1,
+    )
+
+    source_subset = source_subset[
+        source_subset[
+            "txn_amount"
+        ].notna()
+    ].copy()
+
+    if source_subset.empty:
+        return (
+            {
+                **base,
+                "status": "NO_MATCH",
+                "match_reason": (
+                    "NO_USABLE_BANK_AMOUNTS"
+                ),
+                "candidate_count": 0,
+                "source_mode": source_mode,
+            },
+            [],
+        )
+
+    # ========================================================
+    # AMOUNT DIFFERENCE
+    # ========================================================
+
+    source_subset["amount_difference"] = (
+        source_subset[
+            "txn_amount"
+        ] - pop_amount
+    ).abs()
+
+    # ========================================================
+    # EXACT AMOUNT FIRST
+    # ========================================================
+
+    exact = source_subset[
+        source_subset[
+            "amount_difference"
+        ] <= AMOUNT_TOLERANCE
+    ].copy()
+
+    if not exact.empty:
+        candidates = exact
+        amount_mode = "EXACT"
+
+    else:
+        near = source_subset[
+            source_subset[
+                "amount_difference"
+            ] <= NEAR_AMOUNT_TOLERANCE
+        ].copy()
+
+        if near.empty:
+            return (
+                {
+                    **base,
+                    "status": "NO_MATCH",
+                    "match_reason": (
+                        "NO_EXACT_OR_NEAR_AMOUNT"
+                    ),
+                    "candidate_count": 0,
+                    "source_mode": source_mode,
+                },
+                [],
+            )
+
+        candidates = near
+        amount_mode = "NEAR"
+
+    # ========================================================
+    # OPTIONAL DATE FILTER
+    # ========================================================
+
+    # IMPORTANT:
+    #
+    # Current POP has no transaction_date.
+    #
+    # Therefore this block does nothing for the current file.
+    #
+    # If transaction_date is added later, candidates outside
+    # +/- 5 days are removed ONLY when at least one candidate
+    # exists inside the window.
+    #
+    # We deliberately do NOT reject everything simply because
+    # a POP date is unavailable.
+    # ========================================================
+
+    if not pd.isna(pop_date):
+        candidate_dates = candidates[
+            "date"
+        ].map(
+            parse_date
+        )
+
+        date_diffs = (
+            candidate_dates
+            - pop_date
+        ).abs().dt.days
+
+        within_window = candidates[
+            date_diffs.notna()
+            & (
+                date_diffs
+                <= DATE_WINDOW_DAYS
+            )
+        ].copy()
+
+        if not within_window.empty:
+            candidates = within_window
+
+        else:
+            return (
+                {
+                    **base,
+                    "status": "NO_MATCH",
+                    "match_reason": (
+                        "NO_CANDIDATE_WITHIN_DATE_WINDOW"
+                    ),
+                    "candidate_count": len(
+                        candidates
+                    ),
+                    "source_mode": source_mode,
+                },
+                [],
+            )
+
+    # ========================================================
+    # SCORE
+    # ========================================================
+
+    rows = []
+
+    for idx, bank_row in candidates.iterrows():
+
+        scored = score_candidate(
+            pop_row,
+            bank_row,
+            bank_row[
+                "amount_difference"
+            ],
+            amount_mode == "EXACT",
+        )
+
+        row = {
+            **base,
+
+            "bank_row_index": idx,
+
+            "bank_date": bank_row.get(
+                "date"
+            ),
+
+            "bank_value_date": bank_row.get(
+                "value_date"
+            ),
+
+            "bank_description": bank_row.get(
+                "description"
+            ),
+
+            "bank_reference": bank_row.get(
+                "reference"
+            ),
+
+            "bank_customer_reference": bank_row.get(
+                "customer_reference"
+            ),
+
+            "bank_transaction_type": bank_row.get(
+                "transaction_type"
+            ),
+
+            "bank_debit_amount": bank_row.get(
+                "debit_amount"
+            ),
+
+            "bank_credit_amount": bank_row.get(
+                "credit_amount"
+            ),
+
+            "bank_balance": bank_row.get(
+                "balance"
+            ),
+
+            "bank_amount": bank_row.get(
+                "txn_amount"
+            ),
+
+            "source_file": bank_row.get(
+                "source_file"
+            ),
+
+            "bank_name": bank_row.get(
+                "bank_name"
+            ),
+
+            "amount_mode": amount_mode,
+
+            "source_mode": source_mode,
+
+            **scored,
+        }
+
+        row["already_locked"] = (
+            idx in locked_rows
+        )
+
+        row["status"] = ""
+        row["match_reason"] = ""
+        row["score_gap"] = np.nan
+        row["candidate_rank"] = np.nan
+        row["is_selected"] = False
+
+        rows.append(row)
+
+    if not rows:
+        return (
+            {
+                **base,
+                "status": "NO_MATCH",
+                "match_reason": (
+                    "NO_CANDIDATES_AFTER_FILTERING"
+                ),
+                "candidate_count": 0,
+                "source_mode": source_mode,
+            },
+            [],
+        )
+
+    # ========================================================
+    # RANK ALL CANDIDATES
+    # ========================================================
+
+    all_sorted = sort_candidates(
+        rows
+    )
+
+    top_overall = all_sorted[0]
+
+    # ========================================================
+    # AVAILABLE / UNLOCKED CANDIDATES
+    # ========================================================
+
+    usable = [
+        row
+        for row in all_sorted
+        if not row[
+            "already_locked"
+        ]
+    ]
+
+    # --------------------------------------------------------
+    # ALL USED
+    # --------------------------------------------------------
+
+    if not usable:
+        top_overall["status"] = "NO_MATCH"
+        top_overall["match_reason"] = (
+            "ALL_CANDIDATES_ALREADY_USED"
+        )
+
+        for row in rows:
+            if (
+                row["bank_row_index"]
+                == top_overall[
+                    "bank_row_index"
+                ]
+            ):
+                row["status"] = "NO_MATCH"
+                row["match_reason"] = (
+                    "ALL_CANDIDATES_ALREADY_USED"
+                )
+
+        return (
+            {
+                **base,
+                "status": "NO_MATCH",
+                "match_reason": (
+                    "ALL_CANDIDATES_ALREADY_USED"
+                ),
+                "candidate_count": len(
+                    rows
+                ),
+                "score": top_overall[
+                    "score"
+                ],
+                "score_gap": np.nan,
+                "bank_row_index": top_overall[
+                    "bank_row_index"
+                ],
+                "bank_amount": top_overall[
+                    "bank_amount"
+                ],
+                "amount_difference": top_overall[
+                    "amount_difference"
+                ],
+                "amount_mode": top_overall[
+                    "amount_mode"
+                ],
+                "bank_date": top_overall[
+                    "bank_date"
+                ],
+                "date_difference_days": top_overall[
+                    "date_difference_days"
+                ],
+                "reasons": top_overall[
+                    "reasons"
+                ],
+                "source_mode": source_mode,
+            },
+            rows,
+        )
+
+    # ========================================================
+    # BEST AVAILABLE
+    # ========================================================
+
+    best = usable[0]
+
+    strongest_is_locked = (
+        top_overall[
+            "already_locked"
+        ]
+    )
+
+    # ========================================================
+    # SCORE GAP
+    # ========================================================
+
+    if strongest_is_locked:
+
+        gap = (
+            top_overall["score"]
+            - best["score"]
+        )
+
+    else:
+
+        if len(usable) > 1:
+            second = usable[1]
+
+            gap = (
+                best["score"]
+                - second["score"]
+            )
+
+        else:
+            gap = np.inf
+
+    best["score_gap"] = (
+        gap
+        if not np.isinf(gap)
+        else np.nan
+    )
+
+    # ========================================================
+    # EVIDENCE FLAGS
+    # ========================================================
+
+    reasons = best[
+        "reasons"
+    ]
+
+    reference_hit = (
+        "REFERENCE_EXACT"
+        in reasons
+        or
+        "REFERENCE_STRONG"
+        in reasons
+    )
+
+    customer_hit = (
+        "CUSTOMER_EXACT"
+        in reasons
+        or
+        "CUSTOMER_STRONG"
+        in reasons
+    )
+
+    independent_support = (
+        reference_hit
+        or customer_hit
+    )
+
+    exact_date = (
+        "DATE_EXACT"
+        in reasons
+    )
+
+    has_real_pop_date = (
+        not pd.isna(pop_date)
+    )
+
+    # ========================================================
+    # MULTIPLE EXACT AMOUNT CASES
+    # ========================================================
+
+    exact_amount_candidate_count = sum(
+        1
+        for row in rows
+        if row["amount_mode"] == "EXACT"
+    )
+
+    # ========================================================
+    # LOCKED COMPETITION
+    # ========================================================
+
+    locked_competition = (
+        strongest_is_locked
+    )
+
+    # ========================================================
+    # DECISION
+    # ========================================================
+
+    status = "AMBIGUOUS"
+    match_reason = ""
+
+    # ========================================================
+    # EXACT AMOUNT
+    # ========================================================
+
+    if amount_mode == "EXACT":
+
+        # ----------------------------------------------------
+        # CASE 1:
+        # Stronger locked candidate exists.
+        #
+        # The unlocked candidate must beat it sufficiently.
+        # ----------------------------------------------------
+
+        if locked_competition:
+
+            if (
+                best["score"]
+                >= MATCH_THRESHOLD
+                and gap >= MIN_SCORE_GAP
+            ):
+                status = "MATCHED"
+
+                if (
+                    has_real_pop_date
+                    and exact_date
+                ):
+                    match_reason = (
+                        "EXACT_AMOUNT_AND_DATE_AFTER_LOCKED_COMPETITION"
+                    )
+
+                elif reference_hit:
+                    match_reason = (
+                        "EXACT_AMOUNT_AND_REFERENCE_AFTER_LOCKED_COMPETITION"
+                    )
+
+                elif customer_hit:
+                    match_reason = (
+                        "EXACT_AMOUNT_AND_CUSTOMER_AFTER_LOCKED_COMPETITION"
+                    )
+
+                else:
+                    match_reason = (
+                        "EXACT_AMOUNT_AFTER_LOCKED_COMPETITION"
+                    )
+
+            else:
+                status = "AMBIGUOUS"
+                match_reason = (
+                    "STRONGER_LOCKED_CANDIDATE_EXISTS"
+                )
+
+        # ----------------------------------------------------
+        # CASE 2:
+        # Only one exact candidate exists.
+        #
+        # With exact amount and a unique bank transaction,
+        # this is a strong match even though current POP has
+        # no date.
+        # ----------------------------------------------------
+
+        elif exact_amount_candidate_count == 1:
+
+            if (
+                best["score"]
+                >= MATCH_THRESHOLD
+            ):
+                status = "MATCHED"
+
+                if reference_hit:
+                    match_reason = (
+                        "EXACT_AMOUNT_AND_REFERENCE_UNIQUE"
+                    )
+
+                elif customer_hit:
+                    match_reason = (
+                        "EXACT_AMOUNT_AND_CUSTOMER_UNIQUE"
+                    )
+
+                else:
+                    match_reason = (
+                        "EXACT_AMOUNT_UNIQUE"
+                    )
+
+            else:
+                status = "AMBIGUOUS"
+                match_reason = (
+                    "EXACT_AMOUNT_BUT_WEAK_SUPPORT"
+                )
+
+        # ----------------------------------------------------
+        # CASE 3:
+        # Multiple exact candidates.
+        #
+        # We require score separation.
+        # ----------------------------------------------------
+
+        else:
+
+            if (
+                best["score"]
+                >= MATCH_THRESHOLD
+                and gap >= MIN_SCORE_GAP
+                and independent_support
+            ):
+                status = "MATCHED"
+
+                if reference_hit:
+                    match_reason = (
+                        "EXACT_AMOUNT_REFERENCE_CLEAR_WINNER"
+                    )
+
+                elif customer_hit:
+                    match_reason = (
+                        "EXACT_AMOUNT_CUSTOMER_CLEAR_WINNER"
+                    )
+
+                else:
+                    match_reason = (
+                        "EXACT_AMOUNT_CLEAR_WINNER"
+                    )
+
+            else:
+                status = "AMBIGUOUS"
+                match_reason = (
+                    "MULTIPLE_EXACT_AMOUNT_CANDIDATES"
+                )
+
+    # ========================================================
+    # NEAR AMOUNT
+    # ========================================================
+
+    else:
+
+        # Near amount is deliberately much stricter.
+        #
+        # We do NOT want a transaction that is ₹500/₹1000 away
+        # from the POP amount to become a match simply because
+        # it happens to be the closest transaction.
+        # ----------------------------------------------------
+
+        if locked_competition:
+
+            status = "AMBIGUOUS"
+
+            match_reason = (
+                "STRONGER_LOCKED_CANDIDATE_EXISTS"
+            )
+
+        elif (
+            best["score"]
+            >= NEAR_MATCH_THRESHOLD
+            and independent_support
+            and (
+                len(usable) == 1
+                or gap >= MIN_SCORE_GAP
+            )
+            and (
+                not has_real_pop_date
+                or exact_date
+            )
+        ):
+
+            status = "NEAR_AMOUNT"
+
+            if reference_hit:
+                match_reason = (
+                    "NEAR_AMOUNT_WITH_REFERENCE_SUPPORT"
+                )
+
+            elif customer_hit:
+                match_reason = (
+                    "NEAR_AMOUNT_WITH_CUSTOMER_SUPPORT"
+                )
+
+            else:
+                match_reason = (
+                    "NEAR_AMOUNT_WITH_STRONG_SUPPORT"
+                )
+
+        elif len(usable) > 1:
+
+            status = "AMBIGUOUS"
+
+            match_reason = (
+                "MULTIPLE_NEAR_AMOUNT_CANDIDATES"
+            )
+
+        else:
+
+            status = "NO_MATCH"
+
+            match_reason = (
+                "NEAR_AMOUNT_WITHOUT_STRONG_SUPPORT"
+            )
+
+    # ========================================================
+    # COPY DECISION TO BEST CANDIDATE
+    # ========================================================
+
+    best_bank_row_index = (
+        best[
+            "bank_row_index"
+        ]
+    )
+
+    for row in rows:
+
+        if (
+            row[
+                "bank_row_index"
+            ]
+            == best_bank_row_index
+        ):
+            row["status"] = status
+            row["match_reason"] = match_reason
+            row["score_gap"] = (
+                best["score_gap"]
+            )
+
+    # ========================================================
+    # RANK
+    # ========================================================
+
+    all_sorted = sort_candidates(
+        rows
+    )
+
+    for rank, row in enumerate(
+        all_sorted,
+        start=1,
+    ):
+
+        row["candidate_rank"] = rank
+
+        row["is_selected"] = (
+            row[
+                "bank_row_index"
+            ]
+            == best_bank_row_index
+            and status
+            in {
+                "MATCHED",
+                "NEAR_AMOUNT",
+            }
+            and not row[
+                "already_locked"
+            ]
+        )
+
+    # ========================================================
+    # RETURN
+    # ========================================================
+
+    result = {
+        **base,
+
+        "status": status,
+
+        "match_reason": match_reason,
+
+        "score": best[
+            "score"
+        ],
+
+        "score_gap": best[
+            "score_gap"
+        ],
+
+        "candidate_count": len(
+            rows
+        ),
+
+        "source_mode": source_mode,
+
+        "bank_row_index": best[
+            "bank_row_index"
+        ],
+
+        "bank_amount": best[
+            "bank_amount"
+        ],
+
+        "amount_difference": best[
+            "amount_difference"
+        ],
+
+        "amount_mode": best[
+            "amount_mode"
+        ],
+
+        "bank_date": best[
+            "bank_date"
+        ],
+
+        "date_difference_days": best[
+            "date_difference_days"
+        ],
+
+        "bank_value_date": best[
+            "bank_value_date"
+        ],
+
+        "bank_description": best[
+            "bank_description"
+        ],
+
+        "bank_reference": best[
+            "bank_reference"
+        ],
+
+        "bank_customer_reference": best[
+            "bank_customer_reference"
+        ],
+
+        "bank_transaction_type": best[
+            "bank_transaction_type"
+        ],
+
+        "bank_debit_amount": best[
+            "bank_debit_amount"
+        ],
+
+        "bank_credit_amount": best[
+            "bank_credit_amount"
+        ],
+
+        "bank_balance": best[
+            "bank_balance"
+        ],
+
+        "bank_name": best[
+            "bank_name"
+        ],
+
+        "source_file": best[
+            "source_file"
+        ],
+
+        "reasons": best[
+            "reasons"
+        ],
+    }
+
+    return (
+        result,
+        all_sorted,
+    )
+
+
+# ============================================================
+# REQUIRED COLUMNS
+# ============================================================
+
+def validate_columns(
+    pop_df,
+    bank_df,
+):
+    """
+    Validate ONLY columns that are actually required by the
+    current matching engine.
+
+    POP required columns are exactly the columns seen in the
+    user's actual file.
+    """
+
+    required_pop = [
+        "case_number",
+        "email_receipt_amount",
+        "email_receipt_reference",
+        "email_bank_account",
+        "email_customer_name",
+        "email_customer_bank",
+        "email_payment_method",
+        "bank_source_file",
+        "bank_name",
+    ]
+
+    required_bank = [
+        "date",
+        "value_date",
+        "description",
+        "reference",
+        "customer_reference",
+        "transaction_type",
+        "debit_amount",
+        "credit_amount",
+        "balance",
+        "bank_name",
+        "source_file",
+    ]
+
+    missing_pop = [
+        column
+        for column in required_pop
+        if column not in pop_df.columns
+    ]
+
+    missing_bank = [
+        column
+        for column in required_bank
+        if column not in bank_df.columns
+    ]
+
+    if missing_pop:
+        raise ValueError(
+            "Missing POP columns: "
+            + ", ".join(
+                missing_pop
+            )
+        )
+
+    if missing_bank:
+        raise ValueError(
+            "Missing bank columns: "
+            + ", ".join(
+                missing_bank
+            )
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("=" * 100)
+    print("POP -> BANK MATCHING V5")
+    print("=" * 100)
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ========================================================
+    # LOAD POP
+    # ========================================================
+
+    print("\nLoading POP...")
+
+    pop_df = pd.read_excel(
+        POP_FILE
+    )
+
+    print(
+        f"POP rows: {len(pop_df)}"
+    )
+
+    # ========================================================
+    # LOAD BANK
+    # ========================================================
+
+    print("\nLoading bank...")
+
+    bank_df = pd.read_excel(
+        BANK_FILE
+    )
+
+    print(
+        f"Bank rows: {len(bank_df)}"
+    )
+
+    # ========================================================
+    # VALIDATE SCHEMA
+    # ========================================================
+
+    validate_columns(
+        pop_df,
+        bank_df,
+    )
+
+    print(
+        "\nPOP schema validated successfully."
+    )
+
+    print(
+        "Bank schema validated successfully."
+    )
+
+    # ========================================================
+    # ACCOUNT MAP
+    # ========================================================
+
+    account_map = build_account_file_map(
+        bank_df
+    )
+
+    print(
+        f"\nBank accounts detected from filenames: "
+        f"{len(account_map)}"
+    )
+
+    # ========================================================
+    # SOURCE FILE SUMMARY
+    # ========================================================
+
+    print(
+        "\nPOP source-file coverage:"
+    )
+
+    source_values = (
+        pop_df[
+            "bank_source_file"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    source_present = (
+        source_values != ""
+    ).sum()
+
+    source_missing = (
+        source_values == ""
+    ).sum()
+
+    print(
+        f"  POP rows with bank_source_file: "
+        f"{source_present}"
+    )
+
+    print(
+        f"  POP rows without bank_source_file: "
+        f"{source_missing}"
+    )
+
+    # ========================================================
+    # DATE INFORMATION
+    # ========================================================
+
+    if "transaction_date" in pop_df.columns:
+
+        date_count = (
+            pop_df[
+                "transaction_date"
+            ]
+            .notna()
+            .sum()
+        )
+
+        print(
+            f"\nPOP transaction_date available: "
+            f"{date_count} rows"
+        )
+
+    else:
+
+        print(
+            "\nPOP transaction_date: NOT PRESENT"
+        )
+
+        print(
+            "Date will NOT be used as a mandatory criterion."
+        )
+
+    # ========================================================
+    # MATCHING
+    # ========================================================
+
+    matches = []
+    candidates = []
+
+    locked_rows = set()
+
+    print("\n")
+    print("=" * 100)
+    print("MATCHING")
+    print("=" * 100)
+
+    for position, (
+        _,
+        pop_row,
+    ) in enumerate(
+        pop_df.iterrows(),
+        start=1,
+    ):
+
+        best, rows = match_one(
+            pop_row,
+            bank_df,
+            account_map,
+            locked_rows,
+        )
+
+        # ----------------------------------------------------
+        # LOCK ONLY CONFIDENT MATCHES
+        # ----------------------------------------------------
+
+        if best["status"] in {
+            "MATCHED",
+            "NEAR_AMOUNT",
+        }:
+
+            idx = best.get(
+                "bank_row_index"
+            )
+
+            if pd.notna(idx):
+                locked_rows.add(
+                    idx
+                )
+
+        matches.append(
+            best
+        )
+
+        candidates.extend(
+            rows
+        )
+
+        print(
+            f"[{position:>3}/{len(pop_df)}] "
+            f"CASE {best['case_number']} -> "
+            f"{best['status']:<10} | "
+            f"{best['match_reason']}"
+        )
+
+    # ========================================================
+    # DATAFRAMES
+    # ========================================================
+
+    matches_df = pd.DataFrame(
+        matches
+    )
+
+    candidates_df = pd.DataFrame(
+        candidates
+    )
+
+    # ========================================================
+    # MATCH OUTPUT COLUMNS
+    # ========================================================
+
+    match_cols = [
+        "case_number",
+        "status",
+        "match_reason",
+        "score",
+        "score_gap",
+        "candidate_count",
+        "source_mode",
+
+        "pop_account",
+        "pop_amount",
+        "pop_date",
+        "pop_reference",
+        "pop_customer_name",
+        "pop_bank_name",
+        "pop_source_file",
+
+        "bank_amount",
+        "amount_difference",
+        "amount_mode",
+
+        "bank_date",
+        "bank_value_date",
+        "date_difference_days",
+
+        "bank_description",
+        "bank_reference",
+        "bank_customer_reference",
+        "bank_transaction_type",
+
+        "bank_debit_amount",
+        "bank_credit_amount",
+        "bank_balance",
+
+        "bank_name",
+        "source_file",
+        "bank_row_index",
+
+        "reasons",
+    ]
+
+    match_cols = [
+        column
+        for column in match_cols
+        if column in matches_df.columns
+    ]
+
+    remaining_match_cols = [
+        column
+        for column in matches_df.columns
+        if column not in match_cols
+    ]
+
+    matches_df = matches_df[
+        match_cols
+        + remaining_match_cols
+    ]
+
+    # ========================================================
+    # CANDIDATE OUTPUT COLUMNS
+    # ========================================================
+
+    if not candidates_df.empty:
+
+        candidate_cols = [
+            "case_number",
+            "candidate_rank",
+            "is_selected",
+            "already_locked",
+
+            "status",
+            "match_reason",
+
+            "score",
+            "score_gap",
+
+            "source_mode",
+            "amount_mode",
+
+            "pop_account",
+            "pop_amount",
+            "pop_date",
+            "pop_reference",
+            "pop_customer_name",
+            "pop_bank_name",
+            "pop_source_file",
+
+            "bank_amount",
+            "amount_difference",
+
+            "bank_date",
+            "bank_value_date",
+            "date_difference_days",
+
+            "bank_description",
+            "bank_reference",
+            "bank_customer_reference",
+            "bank_transaction_type",
+
+            "bank_debit_amount",
+            "bank_credit_amount",
+            "bank_balance",
+
+            "bank_name",
+            "source_file",
+            "bank_row_index",
+
+            "reasons",
+        ]
+
+        candidate_cols = [
+            column
+            for column in candidate_cols
+            if column in candidates_df.columns
+        ]
+
+        remaining_candidate_cols = [
+            column
+            for column in candidates_df.columns
+            if column not in candidate_cols
+        ]
+
+        candidates_df = candidates_df[
+            candidate_cols
+            + remaining_candidate_cols
+        ]
+
+    # ========================================================
+    # SAVE
+    # ========================================================
+
+    print("\n")
+    print("=" * 100)
+    print("SAVING OUTPUT")
+    print("=" * 100)
+
+    matches_df.to_excel(
+        MATCH_OUTPUT,
+        index=False,
+    )
+
+    candidates_df.to_excel(
+        CANDIDATE_OUTPUT,
+        index=False,
+    )
+
+    print(
+        f"Match output:\n{MATCH_OUTPUT}"
+    )
+
+    print(
+        f"\nCandidate output:\n{CANDIDATE_OUTPUT}"
+    )
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    print("\n")
+    print("=" * 100)
+    print("FINAL MATCHING SUMMARY")
+    print("=" * 100)
+
+    total = len(
+        matches_df
+    )
+
+    counts = (
+        matches_df[
+            "status"
+        ]
+        .value_counts()
+    )
+
+    for status in [
+        "MATCHED",
+        "NEAR_AMOUNT",
+        "AMBIGUOUS",
+        "NO_MATCH",
+    ]:
+
+        count = int(
+            counts.get(
+                status,
+                0,
+            )
+        )
+
+        percentage = (
+            count / total * 100
+            if total
+            else 0
+        )
+
+        print(
+            f"{status:<15}"
+            f"{count:>5} "
+            f"({percentage:>6.2f}%)"
+        )
+
+    # ========================================================
+    # MATCHING PERCENTAGES
+    # ========================================================
+
+    strict_matches = int(
+        (
+            matches_df[
+                "status"
+            ]
+            == "MATCHED"
+        ).sum()
+    )
+
+    usable_matches = int(
+        matches_df[
+            "status"
+        ].isin(
+            [
+                "MATCHED",
+                "NEAR_AMOUNT",
+            ]
+        ).sum()
+    )
+
+    ambiguous = int(
+        (
+            matches_df[
+                "status"
+            ]
+            == "AMBIGUOUS"
+        ).sum()
+    )
+
+    no_match = int(
+        (
+            matches_df[
+                "status"
+            ]
+            == "NO_MATCH"
+        ).sum()
+    )
+
+    strict_percentage = (
+        strict_matches
+        / total
+        * 100
+        if total
+        else 0
+    )
+
+    usable_percentage = (
+        usable_matches
+        / total
+        * 100
+        if total
+        else 0
+    )
+
+    ambiguous_percentage = (
+        ambiguous
+        / total
+        * 100
+        if total
+        else 0
+    )
+
+    no_match_percentage = (
+        no_match
+        / total
+        * 100
+        if total
+        else 0
+    )
+
+    print("\n")
+    print("=" * 100)
+    print("VALIDATION / MATCHING PERCENTAGES")
+    print("=" * 100)
+
+    print(
+        f"Strict MATCHED %       : "
+        f"{strict_percentage:>6.2f}%"
+    )
+
+    print(
+        f"Usable MATCH %         : "
+        f"{usable_percentage:>6.2f}%"
+    )
+
+    print(
+        f"AMBIGUOUS %            : "
+        f"{ambiguous_percentage:>6.2f}%"
+    )
+
+    print(
+        f"NO_MATCH %             : "
+        f"{no_match_percentage:>6.2f}%"
+    )
+
+    print(
+        f"\nUnique bank rows locked: "
+        f"{len(locked_rows)}"
+    )
+
+    print(
+        f"Candidate rows generated: "
+        f"{len(candidates_df)}"
+    )
+
+    # ========================================================
+    # SELECTED MATCHES
+    # ========================================================
+
+    selected = matches_df[
+        matches_df[
+            "status"
+        ].isin(
+            [
+                "MATCHED",
+                "NEAR_AMOUNT",
+            ]
+        )
+    ]
+
+    print("\n")
+    print("=" * 100)
+    print("SELECTED MATCHES")
+    print("=" * 100)
+
+    if selected.empty:
+
+        print(
+            "No selected matches."
+        )
+
+    else:
+
+        display_cols = [
+            "case_number",
+            "status",
+            "match_reason",
+            "score",
+            "score_gap",
+            "candidate_count",
+
+            "pop_amount",
+            "bank_amount",
+            "amount_difference",
+
+            "pop_reference",
+            "bank_reference",
+
+            "pop_customer_name",
+            "bank_description",
+
+            "pop_account",
+            "source_file",
+
+            "pop_date",
+            "bank_date",
+            "date_difference_days",
+
+            "bank_row_index",
+            "reasons",
+        ]
+
+        display_cols = [
+            column
+            for column in display_cols
+            if column in selected.columns
+        ]
+
+        print(
+            selected[
+                display_cols
+            ].to_string(
+                index=False
+            )
+        )
+
+    # ========================================================
+    # FINAL STATUS
+    # ========================================================
+
+    print("\n")
+    print("=" * 100)
+    print("PROCESS COMPLETE")
+    print("=" * 100)
+
+    print(
+        "\nThe matching engine completed successfully."
+    )
+
+    print(
+        "POP schema used: actual 9-column POP schema."
+    )
+
+    print(
+        "Transaction date was treated as OPTIONAL because "
+        "the current POP file does not contain it."
+    )
+
+    print(
+        "\nNext files to inspect:"
+    )
+
+    print(
+        MATCH_OUTPUT
+    )
+
+    print(
+        CANDIDATE_OUTPUT
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()

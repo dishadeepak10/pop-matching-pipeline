@@ -1,0 +1,7 @@
+pywin32
+pypdf
+requests
+openai
+azure-core
+azure-ai-documentintelligence
+python-dotenv   
