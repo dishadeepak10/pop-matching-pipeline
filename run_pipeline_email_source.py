@@ -1,4 +1,4 @@
-"""
+﻿"""
 run_pipeline_email_source.py — same per-POP pipeline as run_pipeline.py,
 but sourcing rows from the Salesforce email log instead of raw documents.
 
@@ -21,9 +21,23 @@ Added --case to process exactly one case number from the email log,
 instead of the whole log - the email-source equivalent of
 run_pipeline.py's --file (there's no single "file" per case here,
 so filtering by case number is the closest matching concept).
+
+Also added E2 subscription-service logging (log_result), one call
+per case actually processed this run (not for SKIPPED cases),
+covering matching failures, invalid data, and successful match
+results alike. There's no per-case file here, so case_number is
+used as the attachment_name.
+
+FIXED: email_data must be a JSON string, not a raw dict, per the
+subscription service's ResultCreate schema (email_data:
+Optional[str]). Now serialized with json.dumps(pop_row,
+default=str) so non-JSON-native types (e.g. pandas Timestamp)
+don't crash serialization. case_number forced to str() for the
+same reason (schema expects Optional[str]).
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -37,6 +51,7 @@ from matching import match_one_pop
 import storage
 from config import KNOWN_BANK_MASTERS, resolve_bank_master
 from logging_setup import configure_logging
+from subscription_client import log_result
 
 logger = configure_logging("run_pipeline_email_source")
 
@@ -71,16 +86,39 @@ def process_one_row(pop_row, bank_df, locked_bank_rows):
         result, candidates, error = match_one_pop(pop_row, bank_df, locked_bank_rows)
     except Exception as e:
         storage.record_failed_pop(case_number, f"MATCHING_ERROR:{e}", pop_row)
+        log_result(
+            str(case_number),
+            "FAILED",
+            email_data=json.dumps(pop_row, default=str),
+            case_number=str(case_number),
+        )
         logger.error(f"FAILED (matching): {e}")
         return "FAILED"
 
     if error:
         storage.record_failed_pop(case_number, error, pop_row)
+        log_result(
+            str(case_number),
+            "INVALID",
+            email_data=json.dumps(pop_row, default=str),
+            case_number=str(case_number),
+        )
         logger.warning(f"SKIPPED (invalid POP data): {error}")
         return "INVALID"
 
     storage.append_match_result(result, pop_row.get("pop_value_date"))
     storage.append_candidate_audit(case_number, candidates, pop_row.get("pop_value_date"))
+
+    log_result(
+        str(case_number),
+        result["status"],
+        score=result.get("score"),
+        email_data=json.dumps(pop_row, default=str),
+        case_number=str(case_number),
+        fields_count=pop_row.get("fields_count"),
+        confidence_score=pop_row.get("overall_confidence"),
+        email_received_date=pop_row.get("email_received_date"),
+    )
 
     logger.info(f"Result: {result['status']} ({result['match_reason']})")
     return result["status"]
@@ -142,5 +180,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-
+    main()

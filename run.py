@@ -1,4 +1,4 @@
-r"""
+﻿r"""
 run.py - single entry point for the POP matching pipeline.
 
 Auto-detects whether the target is a POP document path (routes to
@@ -24,8 +24,16 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from logging_setup import configure_logging
+from subscription_client import check_subscription
 
 logger = configure_logging("run")
+
+# E1 - subscription gate. Must happen before any routing/processing.
+# check_subscription() fails closed (returns False) on network error or
+# inactive subscription, per subscription_client.py's own design.
+if not check_subscription():
+    logger.error("Subscription check failed or inactive - aborting before any processing.")
+    sys.exit(1)
 
 # Maps the current calendar month number to a KNOWN_BANK_MASTERS key.
 # Extend this as new months come into scope (kept here, not in config.py,
@@ -93,5 +101,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-
+    main()

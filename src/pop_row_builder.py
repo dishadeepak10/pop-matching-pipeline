@@ -361,6 +361,7 @@ def build_pop_row(case_number, normalized_data):
         "reference_number": reference,
         "email_receipt_reference": reference,
         "overall_confidence": normalized_data.get("overall_confidence"),
+        "fields_count": len(fields),
     }
 
 

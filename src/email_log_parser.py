@@ -140,6 +140,10 @@ def parse_email_row(case_number, email_body, created_date):
         "email_receipt_reference": reference,
         "email_payment_method": payment_method,
         "overall_confidence": None,
+        "fields_count": sum(1 for v in [amount, bank_name, payment_method, customer_name, account, reference] if v),
+        "email_received_date": pop_value_date,
+        "fields_count": sum(1 for v in [amount, bank_name, payment_method, customer_name, account, reference] if v),
+        "email_received_date": pop_value_date,
     }
 
 
