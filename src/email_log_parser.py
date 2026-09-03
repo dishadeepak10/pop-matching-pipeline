@@ -15,8 +15,16 @@ a row came from.
 """
 
 import re
-
 import pandas as pd
+# --- Currency extraction ---
+#
+# Same policy/approach as pop_row_builder.py's _extract_currency:
+# no conversion is ever performed; a POP's currency must be either
+# confirmed AED (proceeds normally) or confirmed non-AED / unknown
+# (excluded from matching by matching.py's gate). Constants are
+# shared from config.py (Phase 3 cleanup - completed).
+
+from config import KNOWN_CURRENCY_CODES, CURRENCY_NAME_MAP, CURRENCY_SYMBOL_MAP
 
 
 def _extract_field(flat_body, label, stop_labels):
@@ -38,40 +46,6 @@ RECEIPT_LABELS = [
     "Remarks:",
 ]
 
-
-# --- Currency extraction (new this session) ---
-#
-# Same policy/approach as pop_row_builder.py's _extract_currency:
-# no conversion is ever performed; a POP's currency must be either
-# confirmed AED (proceeds normally) or confirmed non-AED / unknown
-# (excluded from matching by matching.py's gate). Kept as a small
-# duplicated helper here rather than importing from pop_row_builder,
-# consistent with how KNOWN_BANK_MASTERS is already intentionally
-# duplicated between the two pipeline scripts (flagged for the same
-# Phase 3 shared-config cleanup).
-
-KNOWN_CURRENCY_CODES = [
-    "AED", "USD", "GBP", "EUR", "SAR", "INR", "PKR", "EGP",
-    "QAR", "KWD", "BHD", "OMR", "JOD", "CNY", "JPY", "CHF",
-]
-
-CURRENCY_NAME_MAP = {
-    "DIRHAM": "AED",
-    "DIRHAMS": "AED",
-    "DOLLAR": "USD",
-    "DOLLARS": "USD",
-    "POUND": "GBP",
-    "POUNDS": "GBP",
-    "STERLING": "GBP",
-    "EURO": "EUR",
-    "EUROS": "EUR",
-}
-
-CURRENCY_SYMBOL_MAP = {
-    "$": "USD",
-    "£": "GBP",
-    "€": "EUR",
-}
 
 
 def _extract_currency_from_text(text):
@@ -126,7 +100,6 @@ def parse_email_row(case_number, email_body, created_date):
             pop_value_date = pd.Timestamp(created_date).strftime("%Y-%m-%d")
         except Exception:
             pass
-
     return {
         "case_number": str(case_number),
         "pop_amount": amount,
@@ -140,8 +113,6 @@ def parse_email_row(case_number, email_body, created_date):
         "email_receipt_reference": reference,
         "email_payment_method": payment_method,
         "overall_confidence": None,
-        "fields_count": sum(1 for v in [amount, bank_name, payment_method, customer_name, account, reference] if v),
-        "email_received_date": pop_value_date,
         "fields_count": sum(1 for v in [amount, bank_name, payment_method, customer_name, account, reference] if v),
         "email_received_date": pop_value_date,
     }

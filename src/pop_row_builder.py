@@ -1,6 +1,26 @@
-﻿import re
+﻿"""
+Builds a normalized POP row from Azure-extracted structured field
+data (document/OCR-sourced path only - see email_log_parser.py for
+the parallel email-log-sourced path, which produces the same row
+shape via a different extraction method).
+
+Field extraction works by scanning all field KEYS from the Azure
+extraction against ordered priority-group patterns (e.g. AMOUNT_GROUPS,
+DATE_GROUPS) rather than relying on fixed field names, since Azure's
+GPT-based extraction generates field names dynamically per document
+and they vary case to case.
+
+Currency policy: no conversion is ever performed. A row's pop_currency
+is either a confirmed explicit currency, or defaults to AED when no
+currency signal is found anywhere (see _extract_currency). matching.py
+is what actually enforces the AED-only gate - this file only detects
+and reports the currency, it never filters based on it.
+"""
+
 
 import pandas as pd
+import re
+from config import KNOWN_CURRENCY_CODES, CURRENCY_NAME_MAP
 
 
 def _find_field(fields, priority_groups, exclude=None):
@@ -254,22 +274,7 @@ CURRENCY_GROUPS = [
     ("currency",),
 ]
 
-KNOWN_CURRENCY_CODES = [
-    "AED", "USD", "GBP", "EUR", "SAR", "INR", "PKR", "EGP",
-    "QAR", "KWD", "BHD", "OMR", "JOD", "CNY", "JPY", "CHF",
-]
 
-CURRENCY_NAME_MAP = {
-    "DIRHAM": "AED",
-    "DIRHAMS": "AED",
-    "DOLLAR": "USD",
-    "DOLLARS": "USD",
-    "POUND": "GBP",
-    "POUNDS": "GBP",
-    "STERLING": "GBP",
-    "EURO": "EUR",
-    "EUROS": "EUR",
-}
 
 
 def _normalize_currency_text(value):

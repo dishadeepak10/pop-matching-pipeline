@@ -48,3 +48,68 @@ def resolve_bank_master(explicit_path, month_key):
         "or --bank-master <path>. Refusing to guess - matching "
         "against the wrong month's bank data is a silent, hard-to-catch bug."
     )
+
+# ============================================================
+# CURRENCY CONSTANTS
+# ============================================================
+# Shared by both POP ingestion paths (pop_row_builder.py for
+# document/OCR-sourced POPs, email_log_parser.py for email-log-sourced
+# POPs). Single source of truth - previously duplicated identically
+# in both files. No currency conversion is ever performed anywhere
+# in this pipeline; these are used only to detect/normalize a
+# currency code, never to convert an amount.
+
+KNOWN_CURRENCY_CODES = [
+    "AED", "USD", "GBP", "EUR", "SAR", "INR", "PKR", "EGP",
+    "QAR", "KWD", "BHD", "OMR", "JOD", "CNY", "JPY", "CHF",
+]
+
+CURRENCY_NAME_MAP = {
+    "DIRHAM": "AED",
+    "DIRHAMS": "AED",
+    "DOLLAR": "USD",
+    "DOLLARS": "USD",
+    "POUND": "GBP",
+    "POUNDS": "GBP",
+    "STERLING": "GBP",
+    "EURO": "EUR",
+    "EUROS": "EUR",
+}
+
+CURRENCY_SYMBOL_MAP = {
+    "$": "USD",
+    "£": "GBP",
+    "€": "EUR",
+}
+# ============================================================
+# CURRENCY CONSTANTS
+# ============================================================
+# Shared by both POP ingestion paths (pop_row_builder.py for
+# document/OCR-sourced POPs, email_log_parser.py for email-log-sourced
+# POPs). Single source of truth - previously duplicated identically
+# in both files. No currency conversion is ever performed anywhere
+# in this pipeline; these are used only to detect/normalize a
+# currency code, never to convert an amount.
+
+KNOWN_CURRENCY_CODES = [
+    "AED", "USD", "GBP", "EUR", "SAR", "INR", "PKR", "EGP",
+    "QAR", "KWD", "BHD", "OMR", "JOD", "CNY", "JPY", "CHF",
+]
+
+CURRENCY_NAME_MAP = {
+    "DIRHAM": "AED",
+    "DIRHAMS": "AED",
+    "DOLLAR": "USD",
+    "DOLLARS": "USD",
+    "POUND": "GBP",
+    "POUNDS": "GBP",
+    "STERLING": "GBP",
+    "EURO": "EUR",
+    "EUROS": "EUR",
+}
+
+CURRENCY_SYMBOL_MAP = {
+    "$": "USD",
+    "£": "GBP",
+    "€": "EUR",
+}
